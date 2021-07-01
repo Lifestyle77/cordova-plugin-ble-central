@@ -30,7 +30,7 @@ var getAccessBackgroundLocationVariable = function () {
     if (process.argv.join("|").indexOf("ACCESS_BACKGROUND_LOCATION=") > -1) {
         return process.argv.join("|").match(/ACCESS_BACKGROUND_LOCATION=(.*?)(\||$)/)[1];
     } else {
-        return getPreferenceValue("ACCESS_BACKGROUND_LOCATION");
+        return false; //getPreferenceValue("ACCESS_BACKGROUND_LOCATION");
     }
 }
 
