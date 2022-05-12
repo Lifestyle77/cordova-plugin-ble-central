@@ -23,6 +23,7 @@
     NSDictionary *bluetoothStates;
 }
 - (CBPeripheral *)findPeripheralByUUID:(NSString *)uuid;
+- (CBPeripheral *)retrievePeripheralWithUUID:(NSString *)uuid;
 - (void)stopScanTimer:(NSTimer *)timer;
 @end
 
@@ -37,9 +38,22 @@
 
     [super pluginInitialize];
 
-    peripherals = [NSMutableSet new];
-    manager = [[CBCentralManager alloc] initWithDelegate:self queue:nil options:@{CBCentralManagerOptionShowPowerAlertKey: @NO}];
+    NSMutableDictionary *options = [[NSMutableDictionary alloc] init];
+    options[CBCentralManagerOptionShowPowerAlertKey] = @NO;
 
+    NSDictionary *pluginSettings = [[self commandDelegate] settings];
+    NSString *enableState = pluginSettings[@"bluetooth_restore_state"];
+    if (![self isFalsey:enableState]) {
+        NSString *restoreIdentifier = [@"true" isEqualToString:[enableState lowercaseString]]
+            ? [[[NSBundle mainBundle] infoDictionary] objectForKey:@"CFBundleIdentifier"]
+            : enableState;
+        options[CBCentralManagerOptionRestoreIdentifierKey] = restoreIdentifier;
+    }
+
+    peripherals = [NSMutableSet new];
+    manager = [[CBCentralManager alloc] initWithDelegate:self queue:nil options:options];
+
+    restoredState = nil;
     connectCallbacks = [NSMutableDictionary new];
     connectCallbackLatches = [NSMutableDictionary new];
     readCallbacks = [NSMutableDictionary new];
@@ -60,12 +74,60 @@
 
 #pragma mark - Cordova Plugin Methods
 
-// TODO add timeout
+- (void)centralManager:(CBCentralManager *)central willRestoreState:(NSDictionary<NSString *,id> *)state {
+    restoredState = state;
+}
+
+- (void)restoredBluetoothState:(CDVInvokedUrlCommand *)command {
+    NSMutableDictionary *state = [[NSMutableDictionary alloc] init];
+
+    if (restoredState) {
+        NSArray *restoredPeripherals = restoredState[CBCentralManagerRestoredStatePeripheralsKey];
+        if (restoredPeripherals != nil) {
+            NSMutableArray *peripherals = [NSMutableArray arrayWithCapacity:[restoredPeripherals count]];
+            for (id peripheral in restoredPeripherals) {
+                [peripherals addObject:[peripheral asDictionary]];
+            }
+
+            state[@"peripherals"] = peripherals;
+        }
+
+        NSArray *restoredScanServices = restoredState[CBCentralManagerRestoredStateScanServicesKey];
+        if (restoredScanServices != nil) {
+            NSMutableArray *uuids = [NSMutableArray arrayWithCapacity:[restoredScanServices count]];
+            for (id uuid in restoredScanServices) {
+                [uuids addObject:[uuid UUIDString]];
+            }
+            
+            state[@"scanServiceUUIDs"] = uuids;
+        }
+
+        if (restoredState[CBCentralManagerRestoredStateScanOptionsKey]) {
+            state[@"scanOptions"] = restoredState[CBCentralManagerRestoredStateScanOptionsKey];
+        }
+    }
+
+    CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK
+                                                  messageAsDictionary:state];
+    [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
+}
+
 - (void)connect:(CDVInvokedUrlCommand *)command {
     NSLog(@"connect");
-    NSString *uuid = [command argumentAtIndex:0];
+    if ([manager state] != CBManagerStatePoweredOn) {
+        NSString *error = @"Bluetooth is disabled";
+        NSLog(@"%@", error);
+        CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR
+                                                          messageAsString:error];
+        [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
+        return;
+    }
 
+    NSString *uuid = [command argumentAtIndex:0];
     CBPeripheral *peripheral = [self findPeripheralByUUID:uuid];
+    if (!peripheral) {
+        peripheral = [self retrievePeripheralWithUUID:uuid];
+    }
 
     if (peripheral) {
         NSLog(@"Connecting to peripheral with UUID : %@", uuid);
@@ -86,9 +148,21 @@
 // If not scanning, try connectedPeripheralsWIthServices or peripheralsWithIdentifiers
 - (void)autoConnect:(CDVInvokedUrlCommand *)command {
     NSLog(@"autoConnect");
+    if ([manager state] != CBManagerStatePoweredOn) {
+        NSString *error = @"Bluetooth is disabled";
+        NSLog(@"%@", error);
+        CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR
+                                                          messageAsString:error];
+        [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
+        return;
+    }
+
     NSString *uuid = [command argumentAtIndex:0];
     
     CBPeripheral *peripheral = [self findPeripheralByUUID:uuid];
+    if (!peripheral) {
+        peripheral = [self retrievePeripheralWithUUID:uuid];
+    }
     
     if (peripheral) {
         NSLog(@"Autoconnecting to peripheral with UUID : %@", uuid);
@@ -156,9 +230,9 @@
 // write: function (device_id, service_uuid, characteristic_uuid, value, success, failure) {
 - (void)write:(CDVInvokedUrlCommand*)command {
     BLECommandContext *context = [self getData:command prop:CBCharacteristicPropertyWrite];
-    NSData *message = [command argumentAtIndex:3]; // This is binary
+    id message = [self tryDecodeBinaryData:[command argumentAtIndex:3]]; // This should be binary
     if (context) {
-        if (message != nil) {
+        if (message != nil && [message isKindOfClass:[NSData class]]) {
             CBPeripheral *peripheral = [context peripheral];
             if ([peripheral state] != CBPeripheralStateConnected) {
                 CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"Peripheral is not connected"];
@@ -174,6 +248,11 @@
             [peripheral writeValue:message forCharacteristic:characteristic type:CBCharacteristicWriteWithResponse];
 
             // response is sent from didWriteValueForCharacteristic
+        } else if (message != nil) {
+            // #897: some alternative BLE plugins expect a string rather than array buffer, so this is a common misuse
+            CDVPluginResult *pluginResult = nil;
+            pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"message was not ArrayBuffer"];
+            [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
         } else {
             CDVPluginResult *pluginResult = nil;
             pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"message was null"];
@@ -187,11 +266,10 @@
     NSLog(@"writeWithoutResponse");
 
     BLECommandContext *context = [self getData:command prop:CBCharacteristicPropertyWriteWithoutResponse];
-    NSData *message = [command argumentAtIndex:3]; // This is binary
-
+    id message = [self tryDecodeBinaryData:[command argumentAtIndex:3]]; // This should be binary
     if (context) {
         CDVPluginResult *pluginResult = nil;
-        if (message != nil) {
+        if (message != nil && [message isKindOfClass:[NSData class]]) {
             CBPeripheral *peripheral = [context peripheral];
             if ([peripheral state] != CBPeripheralStateConnected) {
                 CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"Peripheral is not connected"];
@@ -204,6 +282,9 @@
             [peripheral writeValue:message forCharacteristic:characteristic type:CBCharacteristicWriteWithoutResponse];
 
             pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK];
+        } else if (message != nil) {
+            // #897: some alternative BLE plugins expect a string rather than array buffer, so this is a common misuse
+            pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"message was not ArrayBuffer"];
         } else {
             pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"message was null"];
         }
@@ -274,6 +355,15 @@
 
 - (void)scan:(CDVInvokedUrlCommand*)command {
     NSLog(@"scan");
+    if ([manager state] != CBManagerStatePoweredOn) {
+        NSString *error = @"Bluetooth is disabled";
+        NSLog(@"%@", error);
+        CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR
+                                                          messageAsString:error];
+        [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
+        return;
+    }
+
     discoverPeripheralCallbackId = [command.callbackId copy];
 
     NSArray<NSString *> *serviceUUIDStrings = [command argumentAtIndex:0];
@@ -291,6 +381,15 @@
 
 - (void)startScan:(CDVInvokedUrlCommand*)command {
     NSLog(@"startScan");
+    if ([manager state] != CBManagerStatePoweredOn) {
+        NSString *error = @"Bluetooth is disabled";
+        NSLog(@"%@", error);
+        CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR
+                                                          messageAsString:error];
+        [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
+        return;
+    }
+
     discoverPeripheralCallbackId = [command.callbackId copy];
     NSArray<NSString *> *serviceUUIDStrings = [command argumentAtIndex:0];
     NSArray<CBUUID *> *serviceUUIDs = [self uuidStringsToCBUUIDs:serviceUUIDStrings];
@@ -300,6 +399,15 @@
 
 - (void)startScanWithOptions:(CDVInvokedUrlCommand*)command {
     NSLog(@"startScanWithOptions");
+    if ([manager state] != CBManagerStatePoweredOn) {
+        NSString *error = @"Bluetooth is disabled";
+        NSLog(@"%@", error);
+        CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR
+                                                          messageAsString:error];
+        [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
+        return;
+    }
+
     discoverPeripheralCallbackId = [command.callbackId copy];
     NSArray<NSString *> *serviceUUIDStrings = [command argumentAtIndex:0];
     NSArray<CBUUID *> *serviceUUIDs = [self uuidStringsToCBUUIDs:serviceUUIDStrings];
@@ -318,7 +426,9 @@
 - (void)stopScan:(CDVInvokedUrlCommand*)command {
     NSLog(@"stopScan");
 
-    [manager stopScan];
+    if ([manager state] == CBManagerStatePoweredOn) {
+        [manager stopScan];
+    }
 
     if (discoverPeripheralCallbackId) {
         discoverPeripheralCallbackId = nil;
@@ -398,6 +508,15 @@
 // https://developer.apple.com/documentation/corebluetooth/cbcentralmanager/1518924-retrieveconnectedperipheralswith?language=objc
 - (void)connectedPeripheralsWithServices:(CDVInvokedUrlCommand*)command {
     NSLog(@"connectedPeripheralsWithServices");
+    if ([manager state] != CBManagerStatePoweredOn) {
+        NSString *error = @"Bluetooth is disabled";
+        NSLog(@"%@", error);
+        CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR
+                                                          messageAsString:error];
+        [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
+        return;
+    }
+
     NSArray *serviceUUIDStrings = [command argumentAtIndex:0];
     NSArray<CBUUID *> *serviceUUIDs = [self uuidStringsToCBUUIDs:serviceUUIDStrings];
 
@@ -630,30 +749,58 @@
     NSString *stopNotificationCallbackId = [stopNotificationCallbacks objectForKey:key];
 
     CDVPluginResult *pluginResult = nil;
-
-    if (!characteristic.isNotifying && stopNotificationCallbackId) {
-        if (error) {
-            NSLog(@"%@", error);
-            pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:[error localizedDescription]];
-        } else {
+    
+    if (stopNotificationCallbackId) {
+        if (!characteristic.isNotifying) {
+            // successfully stopped notifications
             pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK];
+            [notificationCallbacks removeObjectForKey:key];
+        } else {
+            if (error) {
+                // error: something went wrong
+                NSLog(@"%@", error);
+                pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:[error localizedDescription]];
+            } else {
+                // error: still notifying
+                NSLog(@"Notifications failed to stop");
+                pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"Notifications failed to stop"];
+            }
         }
+
         [self.commandDelegate sendPluginResult:pluginResult callbackId:stopNotificationCallbackId];
         [stopNotificationCallbacks removeObjectForKey:key];
-        [notificationCallbacks removeObjectForKey:key];
-        NSAssert(![startNotificationCallbacks objectForKey:key], @"%@ existed in both start and stop notification callback dicts!", key);
     }
-    
-    if (characteristic.isNotifying && startNotificationCallbackId) {
-        if (error) {
-            NSLog(@"%@", error);
-            pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:[error localizedDescription]];
-            [self.commandDelegate sendPluginResult:pluginResult callbackId:startNotificationCallbackId];
-            [startNotificationCallbacks removeObjectForKey:key];
-        } else {
+
+    if (startNotificationCallbackId) {
+        if (characteristic.isNotifying) {
+            // successfully started notifications
             // notification start succeeded, move the callback to the value notifications dict
             [notificationCallbacks setObject:startNotificationCallbackId forKey:key];
             [startNotificationCallbacks removeObjectForKey:key];
+        } else {
+            if (error) {
+                // error: something went wrong
+                NSLog(@"%@", error);
+                pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:[error localizedDescription]];
+            } else {
+                // error: not notifying
+                NSLog(@"Notifications failed to start");
+                pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"Notifications failed to start"];
+            }
+
+            [self.commandDelegate sendPluginResult:pluginResult callbackId:startNotificationCallbackId];
+            [startNotificationCallbacks removeObjectForKey:key];
+        }
+    }
+
+    if (!characteristic.isNotifying) {
+        // characteristic is not notifying
+        NSString *notificationCallbackId = [notificationCallbacks objectForKey:key];
+        if (notificationCallbackId) {
+            // error: characteristic no longer notifying
+            pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"Characteristic not notifying"];
+            [self.commandDelegate sendPluginResult:pluginResult callbackId:startNotificationCallbackId];
+            [notificationCallbacks removeObjectForKey:key];
         }
     }
 }
@@ -716,6 +863,17 @@
             peripheral = p;
             break;
         }
+    }
+    return peripheral;
+}
+
+- (CBPeripheral*)retrievePeripheralWithUUID:(NSString*)uuid {
+    NSUUID *typedUUID = [[NSUUID alloc] initWithUUIDString:uuid];
+    NSArray *existingPeripherals = [manager retrievePeripheralsWithIdentifiers:@[typedUUID]];
+    CBPeripheral *peripheral = nil;
+    if ([existingPeripherals count] > 0) {
+        peripheral = [existingPeripherals firstObject];
+        [peripherals addObject:peripheral];
     }
     return peripheral;
 }
@@ -943,6 +1101,20 @@
         [uuids addObject:uuid];
     }
     return uuids;
+}
+
+- (BOOL) isFalsey:(NSString *)value {
+    return value == nil || [value length] == 0 || [@"false" isEqualToString:[value lowercaseString]];
+}
+
+- (id) tryDecodeBinaryData:(id)value {
+    if (value != nil && [value isKindOfClass:[NSString class]]) {
+        NSData *decoded = [[NSData alloc] initWithBase64EncodedString:value options:0];
+        if (decoded != nil) {
+            return decoded;
+        }
+    }
+    return value;
 }
 
 @end
